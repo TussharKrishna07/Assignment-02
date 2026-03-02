@@ -1,81 +1,186 @@
 // chat_client.cpp
 #include <iostream>
-#include <thread>
+#include <fstream>
 #include <string>
+#include <cstring>
+#include <thread>
+#include <atomic>
 #include <arpa/inet.h>
 #include <unistd.h>
-#include <cstring>
 #include "protocol.h"
+using namespace std;
 
-// Thread function to handle incoming messages from server
-void receive_handler(int sock) {
-    MsgHeader header;
-    while (read(sock, &header, sizeof(header)) > 0) {
-        char* payload = new char[header.payload_length + 1]{0};
-        read(sock, payload, header.payload_length);
-        
-        if (header.type == BROADCAST) {
-            std::cout << "\n[Broadcast from " << header.sender << "]: " << payload << "\n> " << std::flush;
-        } else if (header.type == PRIVATE_MSG) {
-            std::cout << "\n[Private from " << header.sender << "]: " << payload << "\n> " << std::flush;
+#define DISCOVERY_IP   "127.0.0.1"
+#define DISCOVERY_PORT 5000
+#define CHAT_PORT      6000
+
+atomic<bool> running(true); // shared flag to stop receiver thread on quit
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+int connect_to(const char* ip, int port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons(port);
+    inet_pton(AF_INET, ip, &addr.sin_addr);
+    if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) return -1;
+    return fd;
+}
+
+void send_message(int fd, int32_t type,
+                  const char* sender, const char* target,
+                  const char* payload) {
+    MsgHeader header{};
+    header.type           = type;
+    header.payload_length = strlen(payload);
+    strncpy(header.sender, sender, 31);
+    strncpy(header.target, target, 31);
+    write(fd, &header,  sizeof(header));
+    write(fd, payload,  header.payload_length);
+}
+
+string read_response(int fd) {
+    MsgHeader header{};
+    if (read(fd, &header, sizeof(header)) <= 0) return "";
+    if (header.payload_length <= 0) return "";
+    char buffer[header.payload_length + 1];
+    memset(buffer, 0, header.payload_length + 1);
+    read(fd, buffer, header.payload_length);
+    return string(buffer);
+}
+
+// ─── Background receiver thread ──────────────────────────────────────────────
+// Sits in a loop reading from chat_fd and printing anything that arrives
+void receive_messages(int chat_fd) {
+    while (running) {
+        MsgHeader header{};
+        int n = read(chat_fd, &header, sizeof(header));
+        if (n <= 0) {
+            if (running) cout << "\n[SERVER DISCONNECTED]\n";
+            running = false;
+            break;
         }
-        delete[] payload;
+
+        char buffer[header.payload_length + 1];
+        memset(buffer, 0, header.payload_length + 1);
+        if (header.payload_length > 0)
+            read(chat_fd, buffer, header.payload_length);
+
+        // Print differently based on message type
+        if (header.type == BROADCAST) {
+            cout << "\n[" << header.sender << " -> ALL]: " << buffer << "\n> ";
+        } else if (header.type == PRIVATE_MSG) {
+            cout << "\n[" << header.sender << " -> YOU]: " << buffer << "\n> ";
+        } else {
+            // Generic server message (errors, notifications etc.)
+            cout << "\n[SERVER]: " << buffer << "\n> ";
+        }
+
+        cout.flush(); // make sure it prints immediately
     }
 }
 
+// ─── Operations ──────────────────────────────────────────────────────────────
+
+bool register_with_discovery(const string& username, const string& password) {
+    int fd = connect_to(DISCOVERY_IP, DISCOVERY_PORT);
+    if (fd < 0) { cerr << "[ERROR] Cannot reach discovery server.\n"; return false; }
+    send_message(fd, REGISTRATION, username.c_str(), "", password.c_str());
+    cout << "[OK] Registered '" << username << "' with discovery server.\n";
+    close(fd);
+    return true;
+}
+
+int login_to_chat(const string& username, const string& password) {
+    int fd = connect_to(DISCOVERY_IP, CHAT_PORT);
+    if (fd < 0) { cerr << "[ERROR] Cannot reach chat server.\n"; return -1; }
+    send_message(fd, LOGIN, username.c_str(), "", password.c_str());
+    string response = read_response(fd);
+    if (response.find("OK") != string::npos) {
+        cout << "[OK] Logged into chat server.\n";
+        return fd;
+    }
+    cerr << "[FAILED] Login rejected: " << response << "\n";
+    close(fd);
+    return -1;
+}
+
+void send_broadcast(int chat_fd, const string& username, const string& message) {
+    send_message(chat_fd, BROADCAST, username.c_str(), "all", message.c_str());
+}
+
+void send_private(int chat_fd, const string& username,
+                  const string& target, const string& message) {
+    send_message(chat_fd, PRIVATE_MSG, username.c_str(), target.c_str(), message.c_str());
+}
+
+void query_users(const string& username) {
+    int fd = connect_to(DISCOVERY_IP, DISCOVERY_PORT);
+    if (fd < 0) { cerr << "[ERROR] Cannot reach discovery server.\n"; return; }
+    send_message(fd, QUERY_USER, username.c_str(), "", "");
+    string response = read_response(fd);
+    cout << "\n── Online Users ──\n" << response << "──────────────────\n";
+    close(fd);
+}
+
+// ─── Main ────────────────────────────────────────────────────────────────────
+
 int main() {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    sockaddr_in serv_addr = {AF_INET, htons(6000)};
-    inet_pton(AF_INET, "127.0.0.1", &serv_addr.sin_addr);
+    string username, password;
 
-    if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
-        std::cerr << "Connection to Chat Server failed.\n";
-        return -1;
-    }
+    cout << "=== Chat Client ===\n";
+    cout << "Username: "; cin >> username;
+    cout << "Password: "; cin >> password;
+    cin.ignore();
 
-    // 1. Initial Login
-    std::string username;
-    std::cout << "Enter username: ";
-    std::cin >> username;
-    
-    MsgHeader login_hdr = {LOGIN, 0};
-    strncpy(login_hdr.sender, username.c_str(), 31);
-    write(sock, &login_hdr, sizeof(login_hdr));
+    if (!register_with_discovery(username, password)) return 1;
 
-    // 2. Start Receiver Thread
-    std::thread(receive_handler, sock).detach();
+    int chat_fd = login_to_chat(username, password);
+    if (chat_fd < 0) return 1;
 
-    // 3. Main CLI Loop
-    std::string input;
-    std::cin.ignore(); // Clear newline
-    while (true) {
-        std::cout << "> ";
-        std::getline(std::cin, input);
-        if (input.empty()) continue;
+    // ── Spawn receiver thread — runs in background the entire session ─────────
+    thread receiver(receive_messages, chat_fd);
+    receiver.detach();
 
-        MsgHeader msg_hdr;
-        strncpy(msg_hdr.sender, username.c_str(), 31);
-        std::string message;
+    cout << "\nCommands:\n"
+         << "  /all <message>        — broadcast to everyone\n"
+         << "  /msg <user> <message> — private message\n"
+         << "  /users                — list online users\n"
+         << "  /quit                 — exit\n\n";
 
-        if (input.substr(0, 4) == "@all") {
-            msg_hdr.type = BROADCAST;
-            message = input.substr(5);
-        } else if (input[0] == '@') {
-            msg_hdr.type = PRIVATE_MSG;
-            size_t space_pos = input.find(' ');
-            std::string target = input.substr(1, space_pos - 1);
-            strncpy(msg_hdr.target, target.c_str(), 31);
-            message = input.substr(space_pos + 1);
+    string line;
+    while (running) {
+        cout << "> ";
+        getline(cin, line);
+        if (line.empty()) continue;
+
+        if (line == "/quit") {
+            running = false;
+            cout << "Goodbye!\n";
+            break;
+
+        } else if (line.substr(0, 4) == "/all") {
+            string message = line.length() > 5 ? line.substr(5) : "";
+            if (message.empty()) { cout << "Usage: /all <message>\n"; continue; }
+            send_broadcast(chat_fd, username, message);
+
+        } else if (line.substr(0, 4) == "/msg") {
+            size_t first_space = line.find(' ', 5);
+            if (first_space == string::npos) { cout << "Usage: /msg <user> <message>\n"; continue; }
+            string target  = line.substr(5, first_space - 5);
+            string message = line.substr(first_space + 1);
+            if (target.empty() || message.empty()) { cout << "Usage: /msg <user> <message>\n"; continue; }
+            send_private(chat_fd, username, target, message);
+
+        } else if (line == "/users") {
+            query_users(username);
+
         } else {
-            std::cout << "Use @all <msg> or @username <msg>\n";
-            continue;
+            cout << "Unknown command.\n";
         }
-
-        msg_hdr.payload_length = message.length();
-        write(sock, &msg_hdr, sizeof(msg_hdr));
-        write(sock, message.c_str(), message.length());
     }
 
-    close(sock);
+    close(chat_fd);
     return 0;
 }
