@@ -1,0 +1,170 @@
+Learnings and Challenges — Multi-User Chat System (Assignment 02)
+===================================================================
+
+1. LESSONS LEARNED
+------------------
+
+1.1 Socket Programming Fundamentals
+    - TCP sockets are byte streams, not message boundaries. Sending a struct
+      in one write() does not guarantee it arrives in one read(). This was the
+      root cause of several early bugs where messages got "merged" or truncated
+      under load.
+    - Setting SO_REUSEADDR on server sockets is essential during development;
+      without it, restarting the server after a crash results in "Address already
+      in use" errors that persist until the TIME_WAIT period expires (~60 seconds).
+    - Using a fixed-size binary header (72 bytes) followed by a variable-length
+      payload proved to be a clean and efficient protocol design. It makes
+      parsing deterministic — always read 72 bytes first, then read exactly
+      payload_length bytes.
+
+1.2 Multithreading and Concurrency
+    - The thread-per-client model is simple to implement and reason about, but
+      it requires careful synchronization. Forgetting to lock the shared
+      active_clients map led to segfaults when clients connected and
+      disconnected simultaneously.
+    - Using std::mutex with lock_guard ensures exception-safe locking.
+      A manual lock()/unlock() approach is error-prone, especially when
+      early returns or exceptions skip the unlock call.
+    - Detached threads (thread(...).detach()) are convenient but make it
+      impossible to join on shutdown. For a production system, keeping
+      thread handles and implementing graceful shutdown would be better.
+    - Mutex contention during broadcast is a real bottleneck. Holding the
+      lock while performing blocking I/O (write to each client socket) is
+      a design mistake I would fix with message queues in a future iteration.
+
+1.3 Protocol Design
+    - Defining a clear message type enum (REGISTRATION, LOGIN, BROADCAST,
+      PRIVATE_MSG, QUERY_USER) from the start made it easy to add new
+      features incrementally. The header's type field acts as a routing key.
+    - Using fixed-width char[32] fields for sender/target simplifies packing
+      and unpacking but limits usernames to 31 characters. A length-prefixed
+      string format would be more flexible.
+    - The Python test client (protocol.py) that mirrors the C++ protocol was
+      extremely valuable for automated testing. Having the same protocol in
+      two languages also validated that the binary format was correctly
+      specified and portable.
+
+1.4 System Architecture
+    - Separating the discovery server (registration) from the chat server
+      (messaging) follows the separation of concerns principle. It means
+      the chat server can be restarted without losing the user database.
+    - Using a flat file (users.txt) as the user store is simple but fragile.
+      Concurrent writes from the discovery server and reads from the chat
+      server can race. An in-memory data structure with file-backed
+      persistence at intervals would be more robust.
+    - The client's background receiver thread pattern (main thread reads
+      stdin, receiver thread reads socket) is the standard approach for
+      interactive chat clients. Using an atomic<bool> flag for clean
+      shutdown was a clean solution.
+
+1.5 Testing and Monitoring
+    - Automated load and stress testing revealed issues that manual testing
+      with 2-3 clients never would. The cold-start latency spike (42 ms on
+      first message) was completely invisible during manual testing.
+    - Reading CPU and memory metrics from /proc is Linux-specific but very
+      lightweight — no external dependencies needed.
+    - The barrier synchronization pattern (all test clients wait until
+      everyone is ready, then send simultaneously) is critical for
+      meaningful load test results. Without it, clients that start first
+      finish before later clients even begin.
+    - Visualization of results (histograms, trend lines) made it much
+      easier to spot patterns and anomalies compared to reading raw numbers.
+
+2. CHALLENGES FACED
+-------------------
+
+2.1 "Address Already in Use" Errors
+    PROBLEM: After killing the server with Ctrl+C, restarting immediately
+    failed with "bind: Address already in use".
+    SOLUTION: Added SO_REUSEADDR socket option before bind(). This allows
+    the kernel to reuse the port even if it's in TIME_WAIT state.
+
+2.2 Message Corruption Under Load
+    PROBLEM: When multiple clients sent messages rapidly, the server
+    occasionally received garbled headers with nonsensical type values.
+    ROOT CAUSE: TCP stream merging — two messages sent back-to-back could
+    be received as one read() call containing both, or a partial read
+    could split a header across two reads.
+    SOLUTION: While not fully fixed in the current version, the Python
+    test client (protocol.py) uses recv_exact() that loops until exactly
+    N bytes are received. The C++ server should adopt a similar approach.
+
+2.3 Thread Race Conditions
+    PROBLEM: Sporadic segfaults when clients disconnected while a
+    broadcast was in progress. The broadcast loop would try to write to
+    a socket that had just been closed by the disconnect handler.
+    SOLUTION: All modifications to active_clients (insert on login,
+    erase on disconnect, iterate on broadcast) are now protected by the
+    same mutex. The fix was straightforward but finding the race was not —
+    it only occurred under heavy concurrent load.
+
+2.4 Barrier Timeout in Stress Tests
+    PROBLEM: When stress-testing with many clients, some clients failed
+    to register or log in before the barrier timeout, causing the entire
+    step to hang or crash.
+    SOLUTION: Added a 30-second timeout to the threading.Barrier and
+    ensured that failed clients still call barrier.wait() so they don't
+    leave other threads stuck. Also added error handling so a single
+    client failure doesn't break the entire test run.
+
+2.5 Monitoring Server PID Detection
+    PROBLEM: pgrep -f "chat_server" sometimes returned the PID of the
+    monitoring script itself (because "chat_server" appeared in the
+    command-line arguments of the Python process).
+    SOLUTION: Used pgrep more carefully and took the first PID returned,
+    which is typically the actual server process. A more robust approach
+    would be to record the PID at startup.
+
+2.6 Cold-Start Latency
+    PROBLEM: The first stress test step (2 clients) showed 42 ms max
+    latency, while subsequent steps with more clients had much lower
+    latencies (~2-6 ms).
+    ROOT CAUSE: First-time file I/O (loading users.txt), initial memory
+    page faults, and glibc/pthread library initialization all contribute
+    to elevated latency on the first requests.
+    RESOLUTION: This is expected behavior; documented as a known artifact
+    in the performance analysis. In production, a warm-up phase would
+    mitigate this.
+
+2.7 Discovery Server Single-Threaded Bottleneck
+    PROBLEM: When many test clients simultaneously tried to register,
+    connections queued up because the discovery server handles one client
+    at a time in a while(true) { accept(); process(); close(); } loop.
+    SOLUTION: Added small stagger delays (50-100 ms) between client
+    spawns in the test scripts. A production fix would be to make the
+    discovery server multi-threaded or use non-blocking I/O.
+
+2.8 Matching C++ and Python Protocol Implementations
+    PROBLEM: The Python struct.pack format for the header initially
+    produced different byte layouts than the C++ struct, causing
+    deserialization failures.
+    ROOT CAUSE: C++ struct padding and alignment can differ from Python
+    struct packing. The C++ MsgHeader has int32_t (4 bytes) + int32_t
+    (4 bytes) + char[32] + char[32] = 72 bytes with no padding, which
+    happens to match Python's "ii32s32s" format.
+    SOLUTION: Verified byte-level compatibility by printing hex dumps
+    on both sides. The format "ii32s32s" in Python produces an identical
+    72-byte layout to the C++ struct.
+
+3. KEY TAKEAWAYS
+----------------
+
+- Start with a well-defined protocol. Having MsgHeader as a fixed-size
+  binary header made everything else (parsing, debugging, cross-language
+  compatibility) straightforward.
+
+- Always protect shared state with proper synchronization, but minimize
+  the work done while holding locks. Performing blocking I/O inside a
+  critical section is a design anti-pattern.
+
+- Automated testing at scale is essential. Bugs that are invisible with
+  2-3 manual clients become immediately apparent with 10-50 automated
+  concurrent clients.
+
+- Performance measurement must be systematic. The combination of latency
+  histograms, resource monitoring, and incremental scaling (stress test)
+  provides a much clearer picture than ad-hoc timing.
+
+- The thread-per-client model works well for moderate concurrency but has
+  fundamental scalability limits. For high-concurrency systems, event-
+  driven architectures (epoll, io_uring) are the standard approach.

@@ -19,6 +19,11 @@ void listening_to_connections(int fd,int port){
 
 int main() {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+
+    // Allow port reuse (avoids "Address already in use" on restart)
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
     listening_to_connections(server_fd,5000);
 
     cout << "Discovery Server (DNS) active on port 5000...\n";
