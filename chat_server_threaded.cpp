@@ -13,20 +13,43 @@
 using namespace std;
 
 map<string, int> active_clients; // Username -> Socket
+map<string,Userinfo>total_clients;
 mutex clients_mtx;
 
-// ─── Verify credentials against users.txt ───────────────────────────────────
-// users.txt format: username password ip port  (written by discovery server)
-bool verify_user(const string& username, const string& password) {
+// ─── Load all users from users.txt into total_clients map ────────────────────
+void load_users() {
     ifstream ifs("users.txt");
     if (!ifs.is_open()) {
         cerr << "[ERROR] Cannot open users.txt\n";
-        return false;
+        return;
     }
     string u, p, ip;
     int port;
-    while (ifs >> u >> p >> ip >> port) {   // skip ip/port columns
-        if (u == username && p == password) return true;
+    while (ifs >> u >> p >> ip >> port) {
+        // Only add new users; preserve active status of existing ones
+        if (total_clients.find(u) == total_clients.end()) {
+            Userinfo info;
+            info.username = u;
+            info.password = p;
+            info.IP       = ip;
+            info.port     = port;
+            info.active   = 0;
+            total_clients[u] = info;
+        } else {
+            // Update credentials/ip/port but keep active status
+            total_clients[u].password = p;
+            total_clients[u].IP       = ip;
+            total_clients[u].port     = port;
+        }
+    }
+}
+
+// ─── Verify credentials against the total_clients map ────────────────────────
+bool verify_user(const string& username, const string& password) {
+    load_users();  // Reload to pick up newly registered users (preserves active status)
+    if (total_clients.find(username) != total_clients.end() &&
+        total_clients[username].password == password) {
+        return true;
     }
     return false;
 }
@@ -65,6 +88,7 @@ void handle_client(int client_socket) {
                 {
                     lock_guard<mutex> lock(clients_mtx);
                     active_clients[my_username] = client_socket;
+                    total_clients[my_username].active = 1;
                 }
 
                 send_response(client_socket, LOGIN, "server", header.sender, "OK");
@@ -118,10 +142,10 @@ void handle_client(int client_socket) {
             string user_list;
             {
                 lock_guard<mutex> lock(clients_mtx);
-                for (auto const& [name, sock] : active_clients)
-                    user_list += name + "\n";
+                for (auto const& [name, info] : total_clients)
+                    user_list += name + " | active: " + to_string(info.active) + "\n";
             }
-            if (user_list.empty()) user_list = "(no users online)";
+            if (user_list.empty()) user_list = "(no users registered)";
             send_response(client_socket, QUERY_USER, "server", header.sender, user_list);
         }
 
@@ -132,6 +156,7 @@ void handle_client(int client_socket) {
     if (!my_username.empty()) {
         lock_guard<mutex> lock(clients_mtx);
         active_clients.erase(my_username);
+        total_clients[my_username].active = 0;
         cout << "[DISCONNECT] " << my_username << " left.\n";
     }
     close(client_socket);
@@ -154,9 +179,9 @@ int main() {
     listen(server_fd, 10);
 
     cout << "Threaded Chat Server active on port 6000...\n";
-
     while (true) {
         int client_fd = accept(server_fd, nullptr, nullptr);
+        load_users();
         thread(handle_client, client_fd).detach();
     }
 }

@@ -72,6 +72,8 @@ void receive_messages(int chat_fd) {
             cout << "\n[" << header.sender << " -> ALL]: " << buffer << "\n> ";
         } else if (header.type == PRIVATE_MSG) {
             cout << "\n[" << header.sender << " -> YOU]: " << buffer << "\n> ";
+        } else if (header.type == QUERY_USER) {
+            cout << "\n── Online Users ──\n" << buffer << "──────────────────\n> ";
         } else {
             // Generic server message (errors, notifications etc.)
             cout << "\n[SERVER]: " << buffer << "\n> ";
@@ -87,9 +89,16 @@ bool register_with_discovery(const string& username, const string& password) {
     int fd = connect_to(DISCOVERY_IP, DISCOVERY_PORT);
     if (fd < 0) { cerr << "[ERROR] Cannot reach discovery server.\n"; return false; }
     send_message(fd, REGISTRATION, username.c_str(), "", password.c_str());
-    cout << "[OK] Registered '" << username << "' with discovery server.\n";
+    // Wait for confirmation before proceeding to login
+    string response = read_response(fd);
+    if (response.find("OK") != string::npos) {
+        cout << "[OK] Registered '" << username << "' with discovery server.\n";
+        close(fd);
+        return true;
+    }
+    cerr << "[ERROR] Registration failed.\n";
     close(fd);
-    return true;
+    return false;
 }
 
 int login_to_chat(const string& username, const string& password) {
@@ -115,13 +124,8 @@ void send_private(int chat_fd, const string& username,
     send_message(chat_fd, PRIVATE_MSG, username.c_str(), target.c_str(), message.c_str());
 }
 
-void query_users(const string& username) {
-    int fd = connect_to(DISCOVERY_IP, DISCOVERY_PORT);
-    if (fd < 0) { cerr << "[ERROR] Cannot reach discovery server.\n"; return; }
-    send_message(fd, QUERY_USER, username.c_str(), "", "");
-    string response = read_response(fd);
-    cout << "\n── Online Users ──\n" << response << "──────────────────\n";
-    close(fd);
+void query_users(int chat_fd, const string& username) {
+    send_message(chat_fd, QUERY_USER, username.c_str(), "", "");
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
@@ -174,7 +178,7 @@ int main() {
             send_private(chat_fd, username, target, message);
 
         } else if (line == "/users") {
-            query_users(username);
+            query_users(chat_fd, username);
 
         } else {
             cout << "Unknown command.\n";

@@ -2,6 +2,9 @@
 #define PROTOCOL_H
 
 #include <cstdint>
+#include <string>
+
+using namespace std;
 
 // Message Types for our "Grammar"
 enum MessageType {
@@ -19,6 +22,14 @@ struct MsgHeader {
     int32_t payload_length;    // Size of the message body following this header [cite: 29]
     char sender[32];          // Username of the person sending 
     char target[32];          // Username of the recipient (used for private messages)
+};
+
+struct Userinfo {
+    string username;
+    string password;
+    string IP;
+    int port;
+    int active;
 };
 
 #endif
