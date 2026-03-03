@@ -1,12 +1,12 @@
 """
-Load Test — spin up 10 concurrent clients, each sending messages,
+Load Test — spin up N concurrent clients, each sending messages,
 and measure end-to-end delivery time.
 
-Writes per-message delivery latencies to  metrics/load_test_latency.csv
+Writes per-message delivery latencies to  metrics/<label>_load_test_latency.csv
 and prints a summary at the end.
 
 Usage:
-    python3 load_test.py [--clients 10] [--messages 20] [--output metrics/load_test_latency.csv]
+    python3 load_test.py [--clients 10] [--messages 20] [--server-label threaded]
 """
 
 import argparse
@@ -31,9 +31,15 @@ PASSWORD     = "pass"
 
 
 def _find_server_pid(name: str = "chat_server") -> int | None:
-    """Find PID of the running chat_server."""
+    """Find PID of the running server process matching `name`."""
     try:
-        out = subprocess.check_output(["pgrep", "-f", name]).decode().split()
+        # Try exact match first, fall back to -f for long names (>15 chars)
+        try:
+            out = subprocess.check_output(["pgrep", "-x", name],
+                                          stderr=subprocess.DEVNULL).decode().split()
+        except subprocess.CalledProcessError:
+            out = subprocess.check_output(["pgrep", "-f", f"^.*/{name}$|^{name}$"],
+                                          stderr=subprocess.DEVNULL).decode().split()
         return int(out[0]) if out else None
     except Exception:
         return None
@@ -98,12 +104,14 @@ def client_worker(client_id: int, num_messages: int,
 def run_load_test(num_clients: int = NUM_CLIENTS,
                   num_messages: int = NUM_MESSAGES,
                   output: str = "metrics/load_test_latency.csv",
-                  monitor_output: str = "metrics/load_test_server_metrics.csv"):
+                  monitor_output: str = "metrics/load_test_server_metrics.csv",
+                  server_label: str = "threaded",
+                  server_bin_name: str = "chat_server"):
     """Run the full load test and return (latencies, server_summary)."""
     os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
 
     # ── Start server monitor ──────────────────────────────────────────────────
-    server_pid = _find_server_pid()
+    server_pid = _find_server_pid(server_bin_name)
     monitor = None
     if server_pid:
         monitor = ServerMonitor(server_pid, monitor_output, interval=2.0)
@@ -143,7 +151,7 @@ def run_load_test(num_clients: int = NUM_CLIENTS,
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print("\n" + "=" * 55)
-    print("         LOAD TEST SUMMARY  (threaded server)")
+    print(f"         LOAD TEST SUMMARY  ({server_label} server)")
     print("=" * 55)
     print(f"  Clients        : {num_clients}")
     print(f"  Messages/client: {num_messages}")
@@ -169,9 +177,17 @@ def run_load_test(num_clients: int = NUM_CLIENTS,
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Load test for threaded chat server")
-    parser.add_argument("--clients",  type=int, default=NUM_CLIENTS)
-    parser.add_argument("--messages", type=int, default=NUM_MESSAGES)
-    parser.add_argument("--output",   default="metrics/load_test_latency.csv")
+    parser = argparse.ArgumentParser(description="Load test for chat server")
+    parser.add_argument("--clients",      type=int, default=NUM_CLIENTS)
+    parser.add_argument("--messages",     type=int, default=NUM_MESSAGES)
+    parser.add_argument("--server-label", default="threaded",
+                        help="Label for output files: threaded|select")
+    parser.add_argument("--server-bin",   default="chat_server",
+                        help="Binary name for pgrep (chat_server or chat_server_select)")
     args = parser.parse_args()
-    run_load_test(args.clients, args.messages, args.output)
+    prefix = f"metrics/{args.server_label}"
+    run_load_test(args.clients, args.messages,
+                  output=f"{prefix}_load_test_latency.csv",
+                  monitor_output=f"{prefix}_load_test_server_metrics.csv",
+                  server_label=args.server_label,
+                  server_bin_name=args.server_bin)

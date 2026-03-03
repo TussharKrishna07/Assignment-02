@@ -7,11 +7,11 @@ For each "step" we add more clients and measure:
   - message delivery latency
   - server CPU / memory
 
-Results are saved to  metrics/stress_test_results.csv
-Server metrics are in  metrics/stress_test_server_metrics.csv
+Results are saved to  metrics/<label>_stress_test_results.csv
+Server metrics in     metrics/<label>_stress_test_server_metrics.csv
 
 Usage:
-    python3 stress_test.py [--start 2] [--step 5] [--max 50] [--msgs 10]
+    python3 stress_test.py [--start 2] [--step 5] [--max 50] [--msgs 10] [--server-label threaded]
 """
 
 import argparse
@@ -34,7 +34,12 @@ PASSWORD = "pass"
 
 def _find_server_pid(name: str = "chat_server") -> int | None:
     try:
-        out = subprocess.check_output(["pgrep", "-f", name]).decode().split()
+        try:
+            out = subprocess.check_output(["pgrep", "-x", name],
+                                          stderr=subprocess.DEVNULL).decode().split()
+        except subprocess.CalledProcessError:
+            out = subprocess.check_output(["pgrep", "-f", f"^.*/{name}$|^{name}$"],
+                                          stderr=subprocess.DEVNULL).decode().split()
         return int(out[0]) if out else None
     except Exception:
         return None
@@ -98,10 +103,12 @@ def _stress_worker(client_id: int, step: int, num_messages: int,
 def run_stress_test(start: int = 2, step: int = 5, max_clients: int = 50,
                     msgs_per_client: int = 10,
                     output: str = "metrics/stress_test_results.csv",
-                    monitor_output: str = "metrics/stress_test_server_metrics.csv"):
+                    monitor_output: str = "metrics/stress_test_server_metrics.csv",
+                    server_label: str = "threaded",
+                    server_bin_name: str = "chat_server"):
     os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
 
-    server_pid = _find_server_pid()
+    server_pid = _find_server_pid(server_bin_name)
     monitor = None
     if server_pid:
         monitor = ServerMonitor(server_pid, monitor_output, interval=2.0)
@@ -186,7 +193,7 @@ def run_stress_test(start: int = 2, step: int = 5, max_clients: int = 50,
 
     # Print final summary
     print("\n" + "=" * 60)
-    print("         STRESS TEST SUMMARY  (threaded server)")
+    print(f"         STRESS TEST SUMMARY  ({server_label} server)")
     print("=" * 60)
     for r in summary_rows:
         print(f"  {r['num_clients']:>3} clients | "
@@ -201,7 +208,7 @@ def run_stress_test(start: int = 2, step: int = 5, max_clients: int = 50,
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Stress test for threaded chat server")
+    parser = argparse.ArgumentParser(description="Stress test for chat server")
     parser.add_argument("--start", type=int, default=2,
                         help="Starting number of clients")
     parser.add_argument("--step",  type=int, default=5,
@@ -210,6 +217,14 @@ if __name__ == "__main__":
                         help="Maximum number of clients")
     parser.add_argument("--msgs",  type=int, default=10,
                         help="Messages each client sends per step")
-    parser.add_argument("--output", default="metrics/stress_test_results.csv")
+    parser.add_argument("--server-label", default="threaded",
+                        help="Label for output files: threaded|select")
+    parser.add_argument("--server-bin",   default="chat_server",
+                        help="Binary name for pgrep (chat_server or chat_server_select)")
     args = parser.parse_args()
-    run_stress_test(args.start, args.step, args.max, args.msgs, args.output)
+    prefix = f"metrics/{args.server_label}"
+    run_stress_test(args.start, args.step, args.max, args.msgs,
+                    output=f"{prefix}_stress_test_results.csv",
+                    monitor_output=f"{prefix}_stress_test_server_metrics.csv",
+                    server_label=args.server_label,
+                    server_bin_name=args.server_bin)
